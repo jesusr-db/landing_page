@@ -1,0 +1,33 @@
+bundle:
+  name: app-portal
+
+variables:
+  portal_title:
+    default: "App Portal"
+  portal_app_name:
+    default: "app-portal"
+
+targets:
+  dev:
+    mode: development
+    variables:
+      portal_title: "App Portal (Dev)"
+      portal_app_name: "app-portal-dev"
+  prod:
+    mode: production
+    variables:
+      portal_title: "Domino's App Portal"   # Override per customer deployment
+      portal_app_name: "app-portal"
+
+resources:
+  apps:
+    app-portal:
+      name: ${var.portal_app_name}
+      description: "Role-based launcher for all Databricks Apps in this workspace"
+      source_code_path: .
+      config:
+        env:
+          - name: PORTAL_TITLE
+            value: ${var.portal_title}
+          - name: PORTAL_APP_NAME
+            value: ${var.portal_app_name}
