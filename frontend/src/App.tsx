@@ -8,7 +8,7 @@ import { AppGrid } from './components/AppGrid'
 export default function App() {
   const { apps, user, loading, error, isStale } = useApps()
   const [search, setSearch] = useState('')
-  const [activeCategory, setActiveCategory] = useState('All')
+  const [activeCategory, setActiveCategory] = useState('Available')
 
   const initials = user?.email?.slice(0, 2).toUpperCase() ?? '??'
 

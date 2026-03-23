@@ -2,10 +2,12 @@ import logging
 import os
 import re
 import time
+import types
 from pathlib import Path
 from typing import Any
 
 import anyio
+import httpx
 from databricks.sdk import WorkspaceClient
 from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse
@@ -50,11 +52,30 @@ class AppCache:
             self._users[email] = apps
 
 
+logging.basicConfig(level=logging.INFO)
 app = FastAPI()
 _cache = AppCache(ttl=300)
 
 DATABRICKS_HOST = os.environ.get("DATABRICKS_HOST", "")
 logger = logging.getLogger(__name__)
+
+
+def _dict_to_ns(d: dict) -> types.SimpleNamespace:
+    """Recursively convert a dict to a SimpleNamespace for attribute-style access."""
+    return types.SimpleNamespace(**{
+        k: [_dict_to_ns(i) if isinstance(i, dict) else i for i in v]
+        if isinstance(v, list) else (_dict_to_ns(v) if isinstance(v, dict) else v)
+        for k, v in d.items()
+    })
+
+
+async def _fetch_acl_obo(app_name: str, token: str, host: str) -> list:
+    """Fetch app ACL using the user's OBO token via REST (avoids SP permission requirement)."""
+    url = f"{host.rstrip('/')}/api/2.0/permissions/apps/{app_name}"
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(url, headers={"Authorization": f"Bearer {token}"})
+        resp.raise_for_status()
+        return [_dict_to_ns(e) for e in resp.json().get("access_control_list", [])]
 
 
 def _parse_category(description: str | None) -> str:
@@ -67,14 +88,14 @@ def _parse_category(description: str | None) -> str:
 def _check_acl(entries: list, user_email: str, user_groups: list[str], levels: list[str]) -> bool:
     """Return True if any ACL entry grants one of `levels` to user or their groups."""
     for entry in entries:
-        perm_levels = [p.permission_level for p in (entry.all_permissions or [])]
+        perm_levels = [p.permission_level for p in (getattr(entry, "all_permissions", None) or [])]
         if not any(lvl in levels for lvl in perm_levels):
             continue
-        if entry.user_name == user_email:
+        if getattr(entry, "user_name", None) == user_email:
             return True
-        if entry.group_name == "users":
+        if getattr(entry, "group_name", None) == "users":
             return True
-        if entry.group_name and entry.group_name in user_groups:
+        if getattr(entry, "group_name", None) and entry.group_name in user_groups:
             return True
     return False
 
@@ -88,12 +109,12 @@ def _check_can_manage(entries: list, user_email: str, user_groups: list[str]) ->
     (viewing non-RUNNING apps) requires an explicit CAN_MANAGE grant.
     """
     for entry in entries:
-        perm_levels = [p.permission_level for p in (entry.all_permissions or [])]
+        perm_levels = [p.permission_level for p in (getattr(entry, "all_permissions", None) or [])]
         if "CAN_MANAGE" not in perm_levels:
             continue
-        if entry.user_name == user_email:
+        if getattr(entry, "user_name", None) == user_email:
             return True
-        if entry.group_name and entry.group_name in user_groups:
+        if getattr(entry, "group_name", None) and entry.group_name in user_groups:
             return True
     return False
 
@@ -110,17 +131,21 @@ async def get_apps(request: Request) -> list[dict]:
         if cached is not None:
             return cached
 
-    # Determine auth mode + init SDK
-    w = WorkspaceClient(host=DATABRICKS_HOST, token=token if token else None)
+    # Use M2M auth (DATABRICKS_CLIENT_ID/SECRET from env in Apps runtime)
+    # w.config.host resolves the actual host even when DATABRICKS_HOST env var is empty
+    w = WorkspaceClient(host=DATABRICKS_HOST)
+    resolved_host = w.config.host
 
-    # Get user groups (OBO mode only)
+    # Get user groups via SCIM lookup
     user_groups: list[str] = []
-    if token:
-        try:
-            me = await anyio.to_thread.run_sync(w.current_user.me)
-            user_groups = [g.display for g in (me.groups or []) if g.display]
-        except Exception as exc:
-            logger.warning("Failed to get user groups: %s", exc)
+    try:
+        users = list(await anyio.to_thread.run_sync(
+            lambda: list(w.users.list(filter=f'userName eq "{email}"', attributes="groups"))
+        ))
+        if users:
+            user_groups = [g.display for g in (users[0].groups or []) if g.display]
+    except Exception as exc:
+        logger.warning("Failed to get user groups: %s", exc)
 
     # Fetch workspace-level raw data
     workspace_data = _cache.get_workspace()
@@ -130,16 +155,34 @@ async def get_apps(request: Request) -> list[dict]:
         raw_acls: dict[str, list] = {}
         raw_apps: list = []
 
+        # Synthetic ACL used when we can't read real permissions:
+        # grants all workspace users CAN_USE so running apps are visible to everyone.
+        _fallback_acl = [_dict_to_ns({
+            "group_name": "users",
+            "all_permissions": [{"permission_level": "CAN_USE"}],
+        })]
+
         async def fetch_acl(app_obj):
             try:
-                perms = await anyio.to_thread.run_sync(
-                    lambda: w.apps.get_permissions(app_name=app_obj.name)
-                )
-                acl_entries = perms.access_control_list or []
-                raw_apps.append(app_obj)
-                raw_acls[app_obj.name] = acl_entries
+                if token:
+                    acl_entries = await _fetch_acl_obo(app_obj.name, token, resolved_host)
+                else:
+                    perms = await anyio.to_thread.run_sync(
+                        lambda: w.apps.get_permissions(app_name=app_obj.name)
+                    )
+                    acl_entries = perms.access_control_list or []
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code == 403:
+                    # Token lacks permissions scope — fall back to "users: CAN_USE"
+                    acl_entries = _fallback_acl
+                else:
+                    logger.warning("Failed to fetch permissions for %s: %s", app_obj.name, exc)
+                    return
             except Exception as exc:
                 logger.warning("Failed to fetch permissions for %s: %s", app_obj.name, exc)
+                return
+            raw_apps.append(app_obj)
+            raw_acls[app_obj.name] = acl_entries
 
         # Uses anyio task group instead of asyncio.gather(return_exceptions=True).
         # Per-app exception isolation is achieved by wrapping each fetch_acl call in
@@ -154,7 +197,7 @@ async def get_apps(request: Request) -> list[dict]:
         _cache.set_workspace(workspace_data)
 
     # Build per-user filtered list
-    _host = DATABRICKS_HOST.removeprefix("https://").removeprefix("http://").rstrip("/")
+    _host = resolved_host.removeprefix("https://").removeprefix("http://").rstrip("/")
     filtered: list[dict] = []
     for app_obj in workspace_data["apps"]:
         if app_obj.name == portal_app_name:
@@ -166,16 +209,18 @@ async def get_apps(request: Request) -> list[dict]:
             continue
 
         manages = _check_can_manage(acl, email, user_groups)
-        status = getattr(getattr(app_obj, "app_status", None), "state", "UNKNOWN")
+        compute = getattr(app_obj, "compute_status", None)
+        compute_state = getattr(compute, "state", None)
+        _compute_state_str = compute_state.value if compute_state is not None else None
+        _STATUS_MAP = {"ACTIVE": "RUNNING", "PENDING": "DEPLOYING", "ERROR": "CRASHED"}
+        status = _STATUS_MAP.get(_compute_state_str, _compute_state_str or "UNKNOWN")
 
-        if status != "RUNNING" and not manages:
-            continue
 
         filtered.append({
             "name": app_obj.name,
             "display_name": getattr(app_obj, "display_name", None) or app_obj.name.replace("-", " ").title(),
             "description": app_obj.description or "",
-            "url": f"https://{_host}/apps/{app_obj.name}",
+            "url": getattr(app_obj, "url", None) or f"https://{_host}/apps/{app_obj.name}",
             "status": status,
             "category": _parse_category(app_obj.description),
             "can_manage": manages,
@@ -189,17 +234,18 @@ async def get_apps(request: Request) -> list[dict]:
 async def get_me(request: Request) -> dict:
     email = request.headers.get("X-Forwarded-Email", "unknown@unknown.com")
     username = request.headers.get("X-Forwarded-Preferred-Username", email.split("@")[0])
-    token = request.headers.get("X-Forwarded-Access-Token")
     portal_title = os.environ.get("PORTAL_TITLE", "App Portal")
 
     groups: list[str] = []
-    if token:
-        try:
-            w = WorkspaceClient(host=DATABRICKS_HOST, token=token)
-            me = await anyio.to_thread.run_sync(w.current_user.me)
-            groups = [g.display for g in (me.groups or []) if g.display]
-        except Exception as exc:
-            logger.warning("Failed to get user groups: %s", exc)
+    try:
+        w = WorkspaceClient(host=DATABRICKS_HOST)
+        users = list(await anyio.to_thread.run_sync(
+            lambda: list(w.users.list(filter=f'userName eq "{email}"', attributes="groups"))
+        ))
+        if users:
+            groups = [g.display for g in (users[0].groups or []) if g.display]
+    except Exception as exc:
+        logger.warning("Failed to get user groups: %s", exc)
 
     return {
         "email": email,

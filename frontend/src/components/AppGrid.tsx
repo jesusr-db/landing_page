@@ -11,7 +11,8 @@ export function AppGrid({ apps, search, activeCategory }: Props) {
   const q = search.toLowerCase().trim()
 
   const visible = apps.filter((a) => {
-    if (activeCategory !== 'All' && a.category !== activeCategory) return false
+    if (activeCategory === 'Available') { if (a.status !== 'RUNNING') return false }
+    else if (activeCategory !== 'All' && a.category !== activeCategory) return false
     if (q && !a.display_name.toLowerCase().includes(q) && !a.description.toLowerCase().includes(q)) return false
     return true
   })

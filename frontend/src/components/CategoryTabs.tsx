@@ -9,6 +9,7 @@ interface Props {
 
 export function CategoryTabs({ apps, activeCategory, onCategory }: Props) {
   const categories = [...new Set(apps.map((a) => a.category))]
+  const availableCount = apps.filter((a) => a.status === 'RUNNING').length
 
   const tabStyle = (active: boolean): CSSProperties => ({
     fontSize: '11px',
@@ -23,6 +24,9 @@ export function CategoryTabs({ apps, activeCategory, onCategory }: Props) {
 
   return (
     <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+      <button style={tabStyle(activeCategory === 'Available')} onClick={() => onCategory('Available')}>
+        Available ({availableCount})
+      </button>
       <button style={tabStyle(activeCategory === 'All')} onClick={() => onCategory('All')}>
         All ({apps.length})
       </button>
